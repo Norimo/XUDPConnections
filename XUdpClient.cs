@@ -1,13 +1,16 @@
-﻿using System.Collections.Concurrent;
+﻿using System;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace XUDPConnections
 {
     public class XUdpClient : IDisposable
     {
         private readonly UdpClient udpClient;
-        private readonly IPEndPoint serverEndPoint;
+        private IPEndPoint serverEndPoint;
         private readonly ConcurrentQueue<byte[]> receivedPackets = new();
         private readonly SemaphoreSlim packetSignal = new(0);
         private readonly CancellationTokenSource cts = new();
@@ -17,24 +20,72 @@ namespace XUDPConnections
         public bool IsConnected { get; private set; }
         public bool IsDisconnected { get; private set; }
 
-        public XUdpClient(string host, int port)
+        public XUdpClient()
         {
             udpClient = new UdpClient();
-            serverEndPoint = new IPEndPoint(Dns.GetHostAddresses(host)[0], port);
             lastMessageTime = DateTime.UtcNow;
         }
 
-        public async Task ConnectAsync()
+        public XUdpClient(int port)
+        {
+            udpClient = new UdpClient(port);
+            lastMessageTime = DateTime.UtcNow;
+        }
+
+        /// <summary>
+        /// Connects to the server and starts listening for messages.
+        /// </summary>
+        public async Task ConnectAsync(string host, int port)
         {
             if (IsConnected) return;
 
+            serverEndPoint = new IPEndPoint(Dns.GetHostAddresses(host)[0], port);
+
+            // Send connection request
             await udpClient.SendAsync(new byte[] { 0x01 }, 1, serverEndPoint);
 
+            // Start background tasks
             _ = Task.Run(ReceiveLoopAsync);
             _ = MonitorTimeoutAsync();
             _ = SendPingLoopAsync();
 
             IsConnected = true;
+        }
+
+        /// <summary>
+        /// Sends arbitrary data to the server.
+        /// </summary>
+        public async Task SendAsync(byte[] data)
+        {
+            if (!IsConnected) throw new InvalidOperationException("Not connected.");
+
+            var packet = new byte[data.Length + 1];
+            packet[0] = 0x02; // Data packet identifier
+            Buffer.BlockCopy(data, 0, packet, 1, data.Length);
+
+            await udpClient.SendAsync(packet, packet.Length, serverEndPoint);
+        }
+
+        /// <summary>
+        /// Receives the next data packet from the server asynchronously.
+        /// </summary>
+        public async Task<byte[]?> ReceiveAsync()
+        {
+            await packetSignal.WaitAsync();
+            if (IsDisconnected) return null;
+            return receivedPackets.TryDequeue(out var data) ? data : null;
+        }
+
+        /// <summary>
+        /// Disconnects from the server.
+        /// </summary>
+        public async Task DisconnectAsync()
+        {
+            if (IsConnected && !IsDisconnected)
+            {
+                await SendControlAsync(0x03); // Disconnect signal
+                Disconnect();
+            }
         }
 
         private async Task ReceiveLoopAsync()
@@ -50,16 +101,19 @@ namespace XUDPConnections
 
                 switch (buffer[0])
                 {
-                    case 0x02:
-                        receivedPackets.Enqueue(buffer.Skip(1).ToArray());
+                    case 0x02: // Data packet
+                        receivedPackets.Enqueue(buffer[1..]);
                         packetSignal.Release();
                         break;
-                    case 0x04: // ping
-                        await SendControlAsync(0x05);
+
+                    case 0x04: // Ping from server
+                        await SendControlAsync(0x05); // Pong response
                         break;
-                    case 0x05: // pong
+
+                    case 0x05: // Pong from server
                         break;
-                    case 0x03: // disconnect
+
+                    case 0x03: // Server disconnected
                         Disconnect();
                         return;
                 }
@@ -71,7 +125,7 @@ namespace XUDPConnections
             while (!IsDisconnected && !cts.IsCancellationRequested)
             {
                 await Task.Delay(3000, cts.Token);
-                await SendControlAsync(0x04);
+                await SendControlAsync(0x04); // Ping
             }
         }
 
@@ -89,31 +143,6 @@ namespace XUDPConnections
         {
             var packet = new byte[] { code };
             await udpClient.SendAsync(packet, packet.Length, serverEndPoint);
-        }
-
-        public async Task SendAsync(byte[] data)
-        {
-            if (!IsConnected) throw new InvalidOperationException("Not connected.");
-            var packet = new byte[data.Length + 1];
-            packet[0] = 0x02;
-            Buffer.BlockCopy(data, 0, packet, 1, data.Length);
-            await udpClient.SendAsync(packet, packet.Length, serverEndPoint);
-        }
-
-        public async Task<byte[]?> ReceiveAsync()
-        {
-            await packetSignal.WaitAsync();
-            if (IsDisconnected) return null;
-            return receivedPackets.TryDequeue(out var data) ? data : null;
-        }
-
-        public async Task DisconnectAsync()
-        {
-            if (IsConnected && !IsDisconnected)
-            {
-                await SendControlAsync(0x03);
-                Disconnect();
-            }
         }
 
         private void Disconnect()
