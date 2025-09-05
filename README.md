@@ -45,19 +45,30 @@ using XUDPConnections;
 
 var listener = new XUdpListener(5460);
 listener.Start();
+List<XUdpConnection> connections = new();
 
-listener.ConnectionAccepted += async (conn) =>
+while (true)
 {
-    Console.WriteLine($"Client connected: {conn.RemoteEndPoint}");
+    var conn = await listener.AcceptConnectionAsync();
+    connections.Add(conn);
 
-    while (true)
+    _ = Task.Run(async () =>
     {
-        var data = await conn.ReceiveAsync();
-        Console.WriteLine($"Received: {System.Text.Encoding.UTF8.GetString(data)}");
+        Console.WriteLine($"Client connected: {conn.RemoteEndPoint}");
 
-        await conn.SendAsync(System.Text.Encoding.UTF8.GetBytes("Pong"));
-    }
-};
+        while (true)
+        {
+            var data = await conn.ReceiveAsync();
+            Console.WriteLine($"Received: {System.Text.Encoding.UTF8.GetString(data)} from: {conn.RemoteEndPoint}");
+
+            foreach (var c in connections)
+            {
+                if (c != conn)
+                    await c.SendAsync(data);
+            }
+        }
+    });
+}
 ```
 
 ### Client
@@ -65,12 +76,22 @@ listener.ConnectionAccepted += async (conn) =>
 using XUDPConnections;
 
 var client = new XUdpClient();
-await client.ConnectAsync("127.0.0.1", 5460);
+await client.ConnectAsync("10.0.10.80", 5460);
 
-await client.SendAsync(System.Text.Encoding.UTF8.GetBytes("Ping"));
+_ = Task.Run(async () =>
+{
+    while (true)
+    {
+        var data = await client.ReceiveAsync();
+        Console.WriteLine($"Client received: {System.Text.Encoding.UTF8.GetString(data)}");
+    }
+});
 
-var response = await client.ReceiveAsync();
-Console.WriteLine($"Server replied: {System.Text.Encoding.UTF8.GetString(response)}");
+while (true)
+{
+    string? line = Console.ReadLine();
+    await client.SendAsync(System.Text.Encoding.UTF8.GetBytes(line));
+}
 ```
 
 ---
